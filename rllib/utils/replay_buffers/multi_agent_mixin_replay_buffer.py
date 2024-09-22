@@ -2,6 +2,7 @@ import collections
 import logging
 import random
 from typing import Any, Dict, Optional
+from copy import deepcopy
 
 import numpy as np
 
@@ -27,6 +28,7 @@ from ray.util.debug import log_once
 
 logger = logging.getLogger(__name__)
 
+DUMMY_BATCH_INDEXES = -1
 
 @DeveloperAPI
 class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
@@ -113,10 +115,12 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
         replay_burn_in: int = 0,
         replay_zero_init_states: bool = True,
         replay_ratio: float = 0.66,
+        combine_prob: float = 0.0,
         underlying_buffer_config: dict = None,
         prioritized_replay_alpha: float = 0.6,
         prioritized_replay_beta: float = 0.4,
         prioritized_replay_eps: float = 1e-6,
+        prioritized_seq_avg_weight: float = 0.1,
         **kwargs
     ):
         """Initializes MultiAgentMixInReplayBuffer instance.
@@ -172,6 +176,10 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
         """
         if not 0 <= replay_ratio <= 1:
             raise ValueError("Replay ratio must be within [0, 1]")
+        if not 0 <= combine_prob <= 1:
+            raise ValueError("Combine probability must be within [0, 1]")
+        if combine_prob == 0.0:
+            replay_ratio = 1.0
 
         MultiAgentPrioritizedReplayBuffer.__init__(
             self,
@@ -191,6 +199,8 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
         )
 
         self.replay_ratio = replay_ratio
+        self.combine_prob = combine_prob
+        self.prioritized_seq_avg_weight = prioritized_seq_avg_weight
 
         self.last_added_batches = collections.defaultdict(list)
 
@@ -307,17 +317,29 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
                     return int(np.ceil(product))
                 else:
                     return int(np.floor(product))
-
-            max_num_new = round_up_or_down(num_items, 1 - self.replay_ratio)
+            
+            if random.random() < self.combine_prob:
+                max_num_new = round_up_or_down(num_items, 1 - self.replay_ratio)
+            else:
+                max_num_new = 0
             # if num_samples * self.replay_ratio is not round,
             # we need one more sample with a probability of
             # (num_items*self.replay_ratio) % 1
 
             _buffer = self.replay_buffers[_policy_id]
-            output_batches = self.last_added_batches[_policy_id][:max_num_new]
-            self.last_added_batches[_policy_id] = self.last_added_batches[_policy_id][
-                max_num_new:
-            ]
+            # be careful!!
+            # last_added_batches point to the replay buffer's _storage, use deepcopy
+            output_batches = deepcopy(random.choices(self.last_added_batches[_policy_id], k=max_num_new))
+            # self.last_added_batches[_policy_id] = self.last_added_batches[_policy_id][
+            #     max_num_new:
+            # ]
+
+            # min_weight = (((replay_buffer._max_priority ** replay_buffer._alpha) / replay_buffer._it_sum.sum()) * len(replay_buffer)) ** (-self.prioritized_replay_beta)
+            # max_weight = ((replay_buffer._it_min.min() / replay_buffer._it_sum.sum()) * len(replay_buffer)) ** (-self.prioritized_replay_beta)
+            norm_w = ((_buffer._max_priority ** _buffer._alpha) / _buffer._it_min.min())  ** (-self.underlying_buffer_call_args['beta'])
+            for output_batch in output_batches:
+                output_batch["batch_indexes"] = np.array([DUMMY_BATCH_INDEXES] * self.replay_sequence_length)
+                output_batch["weights"] = np.array([norm_w] * self.replay_sequence_length)
 
             # No replay desired
             if self.replay_ratio == 0.0:
@@ -328,18 +350,19 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
 
             num_new = len(output_batches)
 
-            if np.isclose(num_new, num_items * (1 - self.replay_ratio)):
-                # The optimal case, we can mix in a round number of old
-                # samples on average
-                num_old = num_items - max_num_new
-            else:
-                # We never want to return more elements than num_items
-                num_old = min(
-                    num_items - max_num_new,
-                    round_up_or_down(
-                        num_new, self.replay_ratio / (1 - self.replay_ratio)
-                    ),
-                )
+            num_old = num_items - max_num_new
+            # if np.isclose(num_new, num_items * (1 - self.replay_ratio)):
+            #     # The optimal case, we can mix in a round number of old
+            #     # samples on average
+            #     num_old = num_items - max_num_new
+            # else:
+            #     # We never want to return more elements than num_items
+            #     num_old = min(
+            #         num_items - max_num_new,
+            #         round_up_or_down(
+            #             num_new, self.replay_ratio / (1 - self.replay_ratio)
+            #         ),
+            #     )
 
             output_batches.append(_buffer.sample(num_old, **kwargs))
             # Depending on the implementation of underlying buffers, samples
@@ -353,6 +376,7 @@ class MultiAgentMixInReplayBuffer(MultiAgentPrioritizedReplayBuffer):
             ) or (
                 len(self.last_added_batches[_policy_id]) == 0
                 and self.replay_ratio < 1.0
+                and self.combine_prob > 0.0
             ):
                 return False
             return True

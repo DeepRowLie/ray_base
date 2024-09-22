@@ -519,7 +519,7 @@ def timeslice_along_seq_lens_with_overlap(
                 )
             )
         num_seq_lens, last_seq_len = divmod(len(sample_batch), max_seq_len)
-        seq_lens = [zero_pad_max_seq_len] * num_seq_lens + (
+        seq_lens = [max_seq_len] * num_seq_lens + (
             [last_seq_len] if last_seq_len else []
         )
 
@@ -586,7 +586,10 @@ def timeslice_along_seq_lens_with_overlap(
             i = 0
             key = "state_in_{}".format(i)
             while key in data:
-                data[key] = sample_batch["state_out_{}".format(i)][begin - 1 : begin]
+                if begin == 0:
+                    data[key] = sample_batch[key][0 : 1]
+                else:
+                    data[key] = sample_batch["state_out_{}".format(i)][begin - 1 : begin]
                 del data["state_out_{}".format(i)]
                 i += 1
                 key = "state_in_{}".format(i)
